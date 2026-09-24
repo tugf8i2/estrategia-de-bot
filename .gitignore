@@ -1,0 +1,9 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.log*
+*.bak*
+.env
+signal_state_*.json
+historial_senales_*.csv
