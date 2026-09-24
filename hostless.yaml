@@ -1,23 +1,30 @@
 build:
+  command: ""
   system: docker
-  min_cpu: 0.2
+  min_cpu: 0.25
   max_cpu: 0.5
-  min_memory: 256
-  max_memory: 512
-
-dockerfile_path: ./Dockerfile
+  min_memory: 512
+  max_memory: 8192
+dockerfile_path: Dockerfile
+working_directory: /
+post_build_command: ""
 start_command: python cloud_app.py
-
 scaling:
   trigger: http_requests
+  min_cpu: 0.01
+  max_cpu: 0.1
+  min_memory: 128
+  max_memory: 256
   min_replicas: 1
   max_replicas: 1
-  min_cpu: 0.1
-  max_cpu: 0.5
-  min_memory: 256
-  max_memory: 256
-
 health_check:
   type: http
-  http_path: /health
   interval_in_seconds: 30
+  http_path: /health
+cron_jobs: []
+workers: []
+review_apps:
+  enabled: false
+  ttl_days: 7
+  inherit_worker_processes: true
+  inherit_cron_jobs: true
