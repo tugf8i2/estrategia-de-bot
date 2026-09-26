@@ -4,6 +4,7 @@
 import csv
 import json
 import os
+from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -17,6 +18,8 @@ STATE_FILE = Path(
 HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 USD_PER_POINT = float(os.environ.get("USD_PER_POINT", "0") or 0)
+STATS_FROM_DATE = os.environ.get("STATS_FROM_DATE", "2026-09-25").strip()
+STATS_TIMEZONE = timezone(timedelta(hours=-5))
 
 
 def number(value):
@@ -26,11 +29,25 @@ def number(value):
         return 0.0
 
 
+def visible_from_baseline(row):
+    if not STATS_FROM_DATE:
+        return True
+    try:
+        baseline = date.fromisoformat(STATS_FROM_DATE)
+        closed_at = datetime.fromisoformat((row.get("cerrada_en") or "").replace("Z", "+00:00"))
+        if closed_at.tzinfo is None:
+            closed_at = closed_at.replace(tzinfo=STATS_TIMEZONE)
+        return closed_at.astimezone(STATS_TIMEZONE).date() >= baseline
+    except (TypeError, ValueError):
+        return False
+
+
 def load_data():
     rows = []
     if HISTORY_FILE.exists():
         with HISTORY_FILE.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
+    rows = [row for row in rows if visible_from_baseline(row)]
 
     equity = 0.0
     peak = 0.0
