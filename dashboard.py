@@ -7,8 +7,13 @@ import os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", "historial_senales_vantage_xauusd.csv"))
-STATE_FILE = Path(os.environ.get("STATE_FILE", "signal_state_vantage_xauusd.json"))
+DATA_DIR = Path(os.environ.get("SIGNAL_DATA_DIR", "."))
+HISTORY_FILE = Path(
+    os.environ.get("HISTORY_FILE", str(DATA_DIR / "historial_senales_vantage_xauusd.csv"))
+)
+STATE_FILE = Path(
+    os.environ.get("STATE_FILE", str(DATA_DIR / "signal_state_vantage_xauusd.json"))
+)
 HOST = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.environ.get("DASHBOARD_PORT", "8080"))
 USD_PER_POINT = float(os.environ.get("USD_PER_POINT", "0") or 0)
