@@ -47,6 +47,7 @@ cfg = BotConfig(
     adx_threshold=23.0,              # subido un poco (era 20) — moderado, no tan estricto como 25
     min_candle_body_filter_enabled=True,
     min_candle_body_atr_ratio=0.4,   # subido un poco (era 0.3) — la vela debe tener cuerpo >= 40% del ATR
+    liquidity_filter_enabled=True,   # exige barrido + rechazo de liquidez en 15m
 
     # --- Auto-trading en Vantage vía MT5 (APAGADO por defecto — el bot solo avisa) ---
     mt5_trading_enabled=False,

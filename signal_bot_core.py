@@ -103,17 +103,22 @@ class BotConfig:
     min_candle_body_filter_enabled: bool = False
     min_candle_body_atr_ratio: float = 0.3  # el cuerpo de la vela de entrada debe ser >= 30% del ATR
 
+    # --- Filtro opcional de zonas de liquidez (Supertrend y envolvente) ---
+    # Exige un barrido y rechazo de una zona donde coincidan un swing reciente
+    # y un nodo de alto volumen. Permanece desactivado hasta validarlo.
+    liquidity_filter_enabled: bool = False
+    liquidity_volume_bins: int = 20
+    liquidity_volume_top_pct: float = 0.7
+    liquidity_zone_tolerance_pct: float = 0.002
+    liquidity_lookback_candles: int = 5
+
     # --- Break-even automático: no evita señales perdedoras, cambia el costo de un
     # barrido de stop DESPUÉS de ir ganando. Al avanzar breakeven_trigger_pct del
-    # camino hacia el TP, el SL se mueve a la entrada + un colchón de ganancia
-    # asegurada (no a la entrada exacta) — si después te sacan, te llevás una
-    # ganancia chica en vez de terminar en ~0. No afecta señales que van
-    # directo al SL.
+    # camino hacia el TP, el SL se mueve a un porcentaje configurado de ese
+    # mismo recorrido. No afecta señales que van directo al SL.
     breakeven_enabled: bool = True
-    breakeven_trigger_pct: float = 0.5  # 0.5 = a mitad de camino hacia el TP
-    breakeven_profit_lock_points: float = 2.0  # cuánta ganancia asegura el SL movido (en puntos de precio, recalibrar por instrumento)
-    profit_lock_trigger_pct: float = 0.9  # al 90% del recorrido hacia el TP
-    profit_lock_target_pct: float = 0.5  # mueve el SL al 50% del recorrido entrada->TP
+    breakeven_trigger_pct: float = 0.9  # a qué % del camino hacia el TP se activa
+    breakeven_lock_pct: float = 0.5     # a qué % del camino hacia el TP se mueve el SL
 
     # --- Supertrend (se deja disponible por si querés volver a esto con trend_indicator="supertrend") ---
     supertrend_entry_enabled: bool = True
@@ -662,6 +667,75 @@ def find_swing_points(df: pd.DataFrame, wing: int = 2):
     return swing_highs, swing_lows
 
 
+def compute_volume_profile_levels(df: pd.DataFrame, bins: int = 20, top_pct: float = 0.7):
+    """Devuelve centros de tramos de precio con volumen agregado alto."""
+    if df.empty or "volume" not in df.columns or bins <= 0 or not 0 <= top_pct <= 1:
+        return []
+    price_min = float(df["low"].min())
+    price_max = float(df["high"].max())
+    if not np.isfinite(price_min) or not np.isfinite(price_max) or price_max <= price_min:
+        return []
+
+    bin_edges = np.linspace(price_min, price_max, bins + 1)
+    volume_per_bin = np.zeros(bins)
+    mids = (df["high"].to_numpy(dtype=float) + df["low"].to_numpy(dtype=float)) / 2
+    volumes = df["volume"].to_numpy(dtype=float)
+    for mid, volume in zip(mids, volumes):
+        if not np.isfinite(mid) or not np.isfinite(volume) or volume <= 0:
+            continue
+        idx = int((mid - price_min) / (price_max - price_min) * bins)
+        volume_per_bin[min(max(idx, 0), bins - 1)] += volume
+
+    populated = volume_per_bin[volume_per_bin > 0]
+    if populated.size == 0:
+        return []
+    threshold = np.quantile(populated, top_pct)
+    return [
+        float((bin_edges[i] + bin_edges[i + 1]) / 2)
+        for i, volume in enumerate(volume_per_bin)
+        if volume >= threshold and volume > 0
+    ]
+
+
+def find_liquidity_zones(df: pd.DataFrame, wing: int = 2, bins: int = 20,
+                         top_pct: float = 0.7, tolerance_pct: float = 0.002):
+    """Cruza swings con nodos de volumen y devuelve soportes y resistencias."""
+    swing_highs, swing_lows = find_swing_points(df, wing=wing)
+    high_volume_levels = compute_volume_profile_levels(df, bins=bins, top_pct=top_pct)
+    if not high_volume_levels:
+        return [], []
+
+    def confirmed(levels):
+        return [
+            float(level)
+            for level in levels
+            if any(hv and abs(level - hv) / abs(hv) <= tolerance_pct for hv in high_volume_levels)
+        ]
+
+    return confirmed(swing_lows), confirmed(swing_highs)
+
+
+def detect_liquidity_rejection(cfg: BotConfig, df: pd.DataFrame, side: str):
+    """Detecta un barrido y cierre de regreso sobre una zona reciente."""
+    support_zones, resistance_zones = find_liquidity_zones(
+        df,
+        wing=cfg.sr_fractal_wing,
+        bins=cfg.liquidity_volume_bins,
+        top_pct=cfg.liquidity_volume_top_pct,
+        tolerance_pct=cfg.liquidity_zone_tolerance_pct,
+    )
+    recent = df.tail(max(1, cfg.liquidity_lookback_candles))
+    zones = support_zones if side == "LONG" else resistance_zones
+    for zone in zones:
+        if side == "LONG":
+            swept = recent[(recent["low"] < zone) & (recent["close"] > zone)]
+        else:
+            swept = recent[(recent["high"] > zone) & (recent["close"] < zone)]
+        if not swept.empty:
+            return True, zone
+    return False, None
+
+
 def cluster_levels(levels, tolerance_pct: float):
     if not levels:
         return []
@@ -959,6 +1033,16 @@ def evaluate_trend_signal(cfg: BotConfig, df_entry, price, support, resistance, 
             return None
 
     side = "LONG" if current_dir == 1 else "SHORT"
+
+    if cfg.liquidity_filter_enabled:
+        rejection_ok, zone = detect_liquidity_rejection(cfg, df_entry, side)
+        if not rejection_ok:
+            cfg.log.info(
+                "[TENDENCIA] Giro detectado sin rechazo confirmado en zona de liquidez (15m); se descarta."
+            )
+            return None
+        cfg.log.info("[TENDENCIA] Rechazo de liquidez confirmado en %.2f.", zone)
+
     sl = float(st_entry.iloc[-1])
     tp = price + cfg.tp_points if side == "LONG" else price - cfg.tp_points
     tp, reward, rr, adjusted = apply_soft_rr_adjustment(cfg, price, tp, sl, side)
@@ -1025,9 +1109,10 @@ def evaluate_macd_bb_signal(cfg: BotConfig, df_entry, price, support, resistance
     }
 
 
-def evaluate_engulfing_signal(cfg: BotConfig, symbol: str, support, resistance, trend_direction: int):
+def evaluate_engulfing_signal(cfg: BotConfig, symbol: str, support, resistance, trend_direction: int,
+                              df_entry_15m=None):
     """Relleno para tendencia: envolvente en temporalidad chica, a favor de la
-    tendencia de 4H, confirmada con volumen."""
+    tendencia de 4H, confirmada con volumen y, opcionalmente, liquidez en 15m."""
     df = get_klines(cfg, symbol, cfg.engulfing_interval, limit=60)
     price = float(df["close"].iloc[-1])
 
@@ -1065,12 +1150,25 @@ def evaluate_engulfing_signal(cfg: BotConfig, symbol: str, support, resistance, 
         )
         return None
 
+    side = "LONG" if pattern == "BULLISH" else "SHORT"
+
+    if cfg.liquidity_filter_enabled:
+        if df_entry_15m is None or df_entry_15m.empty:
+            cfg.log.info("[ENGULFING] Filtro de liquidez activo sin datos de 15m; se descarta.")
+            return None
+        rejection_ok, zone = detect_liquidity_rejection(cfg, df_entry_15m, side)
+        if not rejection_ok:
+            cfg.log.info(
+                "[ENGULFING] Patrón %s sin rechazo confirmado en zona de liquidez (15m); se descarta.",
+                pattern,
+            )
+            return None
+        cfg.log.info("[ENGULFING] Rechazo de liquidez confirmado en %.2f.", zone)
+
     if pattern == "BULLISH":
-        side = "LONG"
         sl = float(engulfing_candle["low"]) - cushion
         tp = price + cfg.tp_points
     else:
-        side = "SHORT"
         sl = float(engulfing_candle["high"]) + cushion
         tp = price - cfg.tp_points
 
@@ -1130,7 +1228,9 @@ def evaluate_new_signal(cfg: BotConfig, symbol: str):
         elif cfg.trend_indicator == "supertrend" and cfg.supertrend_entry_enabled:
             signal = evaluate_trend_signal(cfg, df_entry, price, support, resistance, regime_direction)
         if signal is None and cfg.engulfing_mode_enabled:
-            signal = evaluate_engulfing_signal(cfg, symbol, support, resistance, regime_direction)
+            signal = evaluate_engulfing_signal(
+                cfg, symbol, support, resistance, regime_direction, df_entry_15m=df_entry,
+            )
         return signal
     else:
         if not cfg.reversion_mode_enabled:
@@ -1173,14 +1273,10 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
     exit_price = float(df_since_open["close"].iloc[-1])
     entry = state["entry"]
 
-    # --- Protección progresiva de ganancia ---
-    # 1) Al 50% del recorrido, conserva el break-even actual: entrada + colchón.
-    # 2) Al 90% del recorrido, el SL pasa al 50% del camino entrada->TP.
-    # Se revisa retroactivamente sobre toda la ventana para no perder disparos
-    # ocurridos entre dos revisiones.
-    locked_sl = (entry + cfg.breakeven_profit_lock_points) if side == "LONG" else (entry - cfg.breakeven_profit_lock_points)
+    # Al avanzar hasta el umbral configurado, asegura un porcentaje del
+    # recorrido entrada->TP. El cálculo relativo funciona igual en LONG/SHORT.
     reward_total = tp - entry
-    profit_locked_sl = entry + cfg.profit_lock_target_pct * reward_total
+    locked_sl = entry + cfg.breakeven_lock_pct * reward_total
 
     breakeven_time = None
     if state.get("breakeven_time"):
@@ -1199,29 +1295,8 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
             state["breakeven_time"] = breakeven_time.isoformat()
             save_state(cfg, state)
             cfg.log.info(
-                "Break-even activado: SL movido a %.2f (entrada %.2f + colchón de %.2f) desde la vela de %s",
-                locked_sl, entry, cfg.breakeven_profit_lock_points, breakeven_time,
-            )
-
-    profit_lock_time = None
-    if state.get("profit_lock_time"):
-        profit_lock_time = pd.Timestamp(state["profit_lock_time"])
-        if profit_lock_time.tzinfo is None:
-            profit_lock_time = profit_lock_time.tz_localize("UTC")
-    elif cfg.breakeven_enabled and not state.get("profit_lock_triggered", False):
-        profit_trigger_price = entry + cfg.profit_lock_trigger_pct * reward_total
-        if side == "LONG":
-            profit_hits = df_since_open[df_since_open["high"] >= profit_trigger_price]
-        else:
-            profit_hits = df_since_open[df_since_open["low"] <= profit_trigger_price]
-        if not profit_hits.empty:
-            profit_lock_time = profit_hits["start"].iloc[0]
-            state["profit_lock_triggered"] = True
-            state["profit_lock_time"] = profit_lock_time.isoformat()
-            save_state(cfg, state)
-            cfg.log.info(
-                "Protección 90%% activada: SL movido al 50%% del recorrido, %.2f, desde la vela de %s",
-                profit_locked_sl, profit_lock_time,
+                "Protección activada: SL movido a %.2f (%.0f%% del camino; entrada=%.2f, tp=%.2f) desde %s",
+                locked_sl, cfg.breakeven_lock_pct * 100, entry, tp, breakeven_time,
             )
 
     if breakeven_time is not None:
@@ -1240,34 +1315,15 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
     if side == "LONG":
         tp_hits = pd.concat([before[before["high"] >= tp], after[after["high"] >= tp]])
         sl_hits_before = before[before["low"] <= sl]
-        if profit_lock_time is not None:
-            sl_hits_after = after_for_sl[
-                (after_for_sl["start"] < profit_lock_time) & (after_for_sl["low"] <= locked_sl)
-            ]
-            sl_hits_profit_lock = df_since_open[
-                (df_since_open["start"] > profit_lock_time) & (df_since_open["low"] <= profit_locked_sl)
-            ]
-        else:
-            sl_hits_after = after_for_sl[after_for_sl["low"] <= locked_sl]
-            sl_hits_profit_lock = df_since_open.iloc[0:0]
+        sl_hits_after = after_for_sl[after_for_sl["low"] <= locked_sl]
     else:
         tp_hits = pd.concat([before[before["low"] <= tp], after[after["low"] <= tp]])
         sl_hits_before = before[before["high"] >= sl]
-        if profit_lock_time is not None:
-            sl_hits_after = after_for_sl[
-                (after_for_sl["start"] < profit_lock_time) & (after_for_sl["high"] >= locked_sl)
-            ]
-            sl_hits_profit_lock = df_since_open[
-                (df_since_open["start"] > profit_lock_time) & (df_since_open["high"] >= profit_locked_sl)
-            ]
-        else:
-            sl_hits_after = after_for_sl[after_for_sl["high"] >= locked_sl]
-            sl_hits_profit_lock = df_since_open.iloc[0:0]
+        sl_hits_after = after_for_sl[after_for_sl["high"] >= locked_sl]
 
     first_tp_time = tp_hits["start"].iloc[0] if not tp_hits.empty else None
     first_sl_before_time = sl_hits_before["start"].iloc[0] if not sl_hits_before.empty else None
     first_sl_after_time = sl_hits_after["start"].iloc[0] if not sl_hits_after.empty else None
-    first_sl_profit_lock_time = sl_hits_profit_lock["start"].iloc[0] if not sl_hits_profit_lock.empty else None
 
     # Elegimos el evento que ocurrió PRIMERO en el tiempo entre los 3 posibles
     # (TP, SL original antes del break-even, SL=entrada+colchón después del
@@ -1279,9 +1335,10 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
     if first_sl_before_time is not None:
         candidates.append(("PERDEDORA (SL)", first_sl_before_time, sl, 1))
     if first_sl_after_time is not None:
-        candidates.append(("GANADORA (BREAK-EVEN, SL a entrada+colchón)", first_sl_after_time, locked_sl, 1))
-    if first_sl_profit_lock_time is not None:
-        candidates.append(("GANADORA (PROTECCIÓN 90%, SL al 50% del recorrido)", first_sl_profit_lock_time, profit_locked_sl, 1))
+        candidates.append((
+            f"GANADORA (PROTECCIÓN, SL asegurado al {cfg.breakeven_lock_pct*100:.0f}% del camino)",
+            first_sl_after_time, locked_sl, 1,
+        ))
 
     if candidates:
         candidates.sort(key=lambda c: (c[1], c[3]))  # por tiempo, y TP gana empates
@@ -1385,7 +1442,7 @@ def execute_trade_tradovate(cfg: BotConfig, signal: dict) -> str:
 
 def execute_trade_mt5(cfg: BotConfig, signal: dict) -> str:
     """Ejecuta la señal como orden real en tu cuenta de Vantage vía MT5, con
-    SL/TP puestos de una vez."""
+    SL/TP puestos de una vez y conserva el precio real de llenado."""
     if not cfg.mt5_symbol:
         cfg.log.error("mt5_trading_enabled=True pero no hay mt5_symbol configurado. No se ejecuta.")
         signal["mt5_executed"] = False
@@ -1403,7 +1460,26 @@ def execute_trade_mt5(cfg: BotConfig, signal: dict) -> str:
         signal["mt5_executed"] = True
         signal["mt5_order_result"] = result
         cfg.log.info("Orden ejecutada en MT5 (Vantage): %s", result)
-        return f"\n✅ Ejecutado en Vantage/MT5: {cfg.mt5_lot_size} lotes de {cfg.mt5_symbol}"
+
+        real_price = result.get("price") if isinstance(result, dict) else None
+        if real_price is not None:
+            real_price = float(real_price)
+            theoretical_entry = signal["entry"]
+            signal["entry_teorica"] = theoretical_entry
+            signal["entry"] = real_price
+            cfg.log.info(
+                "Precio real MT5: %.2f (teórico %.2f; deslizamiento %.2f).",
+                real_price, theoretical_entry, real_price - theoretical_entry,
+            )
+        else:
+            cfg.log.warning(
+                "MT5 no devolvió precio real; se conserva la entrada teórica %.2f.", signal["entry"],
+            )
+
+        return (
+            f"\n✅ Ejecutado en Vantage/MT5: {cfg.mt5_lot_size} lotes de "
+            f"{cfg.mt5_symbol} a {signal['entry']:.2f}"
+        )
     except Exception as e:
         signal["mt5_executed"] = False
         signal["mt5_error"] = str(e)
