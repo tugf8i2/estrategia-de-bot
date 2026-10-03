@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+__pycache__
+tests
+.env
+*.pyc
+*.log*
+signal_state_*.json
+historial_senales_*.csv
+!seed_historial_*.csv
