@@ -78,6 +78,10 @@ class BotConfig:
     sr_cluster_tolerance_pct: float = 0.0015   # % -> ya es relativo, no necesita recalibrarse por instrumento
     proximity_tolerance_pct: float = 0.0020    # % -> idem
     touch_lookback_candles: int = 5
+    reversion_range_filter_enabled: bool = False
+    reversion_range_min_atr: float = 2.0
+    reversion_range_max_atr: float = 8.0
+    reversion_require_closed_candle_rejection: bool = False
 
     # --- TP/SL ---
     tp_points: float = 110.0                  # ¡ESTE SÍ hay que recalibrar por instrumento! (ver notas del bot específico)
@@ -806,11 +810,29 @@ def save_state(cfg: BotConfig, state: dict):
 HISTORY_FIELDS = [
     "abierta_en", "cerrada_en", "side", "entrada", "tp", "sl",
     "salida", "resultado", "puntos", "rsi", "soporte_ref", "resistencia_ref", "rr", "estrategia",
+    "adx_4h", "rango_4h_atr", "rechazo_nivel", "razon_entrada",
 ]
+
+
+def ensure_history_schema(path: str):
+    """Amplía CSV antiguos sin perder filas antes de añadir campos nuevos."""
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        return
+    with open(path, "r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames == HISTORY_FIELDS:
+            return
+        rows = list(reader)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=HISTORY_FIELDS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def log_signal_result(cfg: BotConfig, state: dict, resultado: str, exit_price: float):
     is_new_file = not os.path.exists(cfg.history_file)
+    if not is_new_file:
+        ensure_history_schema(cfg.history_file)
 
     puntos = exit_price - state["entry"] if state["side"] == "LONG" else state["entry"] - exit_price
     rsi_val = state.get("rsi")
@@ -830,6 +852,10 @@ def log_signal_result(cfg: BotConfig, state: dict, resultado: str, exit_price: f
         "resistencia_ref": round(state.get("resistance_ref"), 2) if state.get("resistance_ref") is not None else "",
         "rr": state.get("rr") if state.get("rr") is not None else "",
         "estrategia": state.get("estrategia", ""),
+        "adx_4h": round(state["adx_4h"], 2) if state.get("adx_4h") is not None else "",
+        "rango_4h_atr": round(state["rango_4h_atr"], 2) if state.get("rango_4h_atr") is not None else "",
+        "rechazo_nivel": round(state["rechazo_nivel"], 2) if state.get("rechazo_nivel") is not None else "",
+        "razon_entrada": state.get("razon_entrada", ""),
     }
 
     with open(cfg.history_file, "a", newline="", encoding="utf-8") as f:
@@ -929,7 +955,42 @@ def apply_soft_rr_adjustment(cfg: BotConfig, entry: float, tp: float, sl: float,
     return new_tp, new_reward, new_rr, True
 
 
-def evaluate_reversion_signal(cfg: BotConfig, df_entry, price, support, resistance):
+def evaluate_reversion_range(cfg: BotConfig, df_htf, price, support, resistance):
+    """Valida que el precio esté contenido entre dos niveles con amplitud útil."""
+    if support is None or resistance is None or not support < price < resistance:
+        return False, None, "faltan niveles 4H utilizables alrededor del precio"
+    closed_htf = df_htf.iloc[:-1] if len(df_htf) > 1 else df_htf
+    atr = compute_atr(closed_htf, cfg.atr_period)
+    atr_value = float(atr.iloc[-1]) if len(atr) and not pd.isna(atr.iloc[-1]) else 0.0
+    if atr_value <= 0:
+        return False, None, "ATR 4H no disponible"
+    width_atr = (resistance - support) / atr_value
+    valid = cfg.reversion_range_min_atr <= width_atr <= cfg.reversion_range_max_atr
+    reason = (
+        f"rango 4H={width_atr:.2f} ATR dentro de "
+        f"[{cfg.reversion_range_min_atr:.2f}, {cfg.reversion_range_max_atr:.2f}]"
+        if valid else
+        f"rango 4H={width_atr:.2f} ATR fuera de "
+        f"[{cfg.reversion_range_min_atr:.2f}, {cfg.reversion_range_max_atr:.2f}]"
+    )
+    return valid, width_atr, reason
+
+
+def detect_closed_candle_rejection(cfg: BotConfig, candle, support, resistance):
+    """Confirma toque y cierre de regreso dentro del rango en una vela cerrada."""
+    if support is not None:
+        support_touch = float(candle["low"]) <= support * (1 + cfg.proximity_tolerance_pct)
+        if support_touch and float(candle["close"]) > support:
+            return "LONG", support
+    if resistance is not None:
+        resistance_touch = float(candle["high"]) >= resistance * (1 - cfg.proximity_tolerance_pct)
+        if resistance_touch and float(candle["close"]) < resistance:
+            return "SHORT", resistance
+    return None, None
+
+
+def evaluate_reversion_signal(cfg: BotConfig, df_entry, price, support, resistance,
+                              df_htf=None, current_adx=None):
     """Reversión: soporte/resistencia de 4H + RSI + confirmación de giro. Se usa
     cuando el mercado está LATERAL (sin tendencia 4H clara)."""
     rsi_series = compute_rsi(df_entry["close"], cfg.rsi_period)
@@ -956,23 +1017,37 @@ def evaluate_reversion_signal(cfg: BotConfig, df_entry, price, support, resistan
 
     touched_support = touched(support, recent["low"])
     touched_resistance = touched(resistance, recent["high"])
+    range_valid, range_width_atr, range_reason = True, None, "filtro de rango desactivado"
+    if cfg.reversion_range_filter_enabled:
+        range_valid, range_width_atr, range_reason = evaluate_reversion_range(
+            cfg, df_htf, price, support, resistance,
+        )
+
+    rejection_side = rejection_level = None
+    if cfg.reversion_require_closed_candle_rejection and not df_entry.empty:
+        rejection_side, rejection_level = detect_closed_candle_rejection(
+            cfg, df_entry.iloc[-1], support, resistance,
+        )
+        touched_support = rejection_side == "LONG"
+        touched_resistance = rejection_side == "SHORT"
 
     cfg.log.info(
         "[REVERSIÓN] Precio=%.2f | Soporte=%s (tocado: %s) | Resistencia=%s (tocada: %s) | "
         "RSI(%s)=%.2f (prev=%.2f, subiendo=%s) | umbrales: sobreventa<=%.1f sobrecompra>=%.1f | "
-        "ATR(%d)=%s -> SL dist=%.2f",
+        "ATR(%d)=%s -> SL dist=%.2f | rango=%s | rechazo cerrado=%s",
         price,
         f"{support:.2f}" if support else "N/A", touched_support,
         f"{resistance:.2f}" if resistance else "N/A", touched_resistance,
         cfg.entry_interval, rsi_value, rsi_prev, rsi_turning_up, oversold_threshold, overbought_threshold,
         cfg.atr_period, f"{atr_value:.2f}" if atr_value else "N/A", sl_distance,
+        range_reason, rejection_side or "ninguno",
     )
 
     long_rsi_ok = rsi_value <= oversold_threshold and (not cfg.rsi_require_turn_confirmation or rsi_turning_up)
     short_rsi_ok = rsi_value >= overbought_threshold and (not cfg.rsi_require_turn_confirmation or rsi_turning_down)
 
     signal = None
-    if touched_support and long_rsi_ok:
+    if range_valid and touched_support and long_rsi_ok:
         tp = min(price + cfg.tp_points, resistance) if resistance else price + cfg.tp_points
         sl = support - sl_distance
         tp, reward, rr, adjusted = apply_soft_rr_adjustment(cfg, price, tp, sl, "LONG")
@@ -980,9 +1055,12 @@ def evaluate_reversion_signal(cfg: BotConfig, df_entry, price, support, resistan
             "side": "LONG", "entry": price, "support_ref": support, "resistance_ref": resistance,
             "tp": tp, "sl": sl, "rsi": rsi_value, "rr": round(rr, 2) if rr is not None else None,
             "rr_ajustado": adjusted, "estrategia": "reversion_sr_rsi",
+            "adx_4h": current_adx, "rango_4h_atr": range_width_atr,
+            "rechazo_nivel": rejection_level or support,
+            "razon_entrada": f"rechazo LONG en vela 15m cerrada; {range_reason}; RSI girando al alza",
             "opened_at": datetime.now(timezone.utc).isoformat(),
         }
-    elif touched_resistance and short_rsi_ok:
+    elif range_valid and touched_resistance and short_rsi_ok:
         tp = max(price - cfg.tp_points, support) if support else price - cfg.tp_points
         sl = resistance + sl_distance
         tp, reward, rr, adjusted = apply_soft_rr_adjustment(cfg, price, tp, sl, "SHORT")
@@ -990,6 +1068,9 @@ def evaluate_reversion_signal(cfg: BotConfig, df_entry, price, support, resistan
             "side": "SHORT", "entry": price, "support_ref": support, "resistance_ref": resistance,
             "tp": tp, "sl": sl, "rsi": rsi_value, "rr": round(rr, 2) if rr is not None else None,
             "rr_ajustado": adjusted, "estrategia": "reversion_sr_rsi",
+            "adx_4h": current_adx, "rango_4h_atr": range_width_atr,
+            "rechazo_nivel": rejection_level or resistance,
+            "razon_entrada": f"rechazo SHORT en vela 15m cerrada; {range_reason}; RSI girando a la baja",
             "opened_at": datetime.now(timezone.utc).isoformat(),
         }
     return signal
@@ -1231,12 +1312,29 @@ def evaluate_new_signal(cfg: BotConfig, symbol: str):
             signal = evaluate_engulfing_signal(
                 cfg, symbol, support, resistance, regime_direction, df_entry_15m=df_entry,
             )
+        if signal:
+            signal["adx_4h"] = current_adx
+            signal.setdefault("razon_entrada", f"régimen de tendencia 4H; ADX={current_adx:.2f}" if current_adx is not None else "régimen de tendencia 4H")
         return signal
     else:
         if not cfg.reversion_mode_enabled:
             cfg.log.info("Mercado LATERAL pero reversion_mode_enabled=False — se omite, no se manda señal.")
             return None
-        return evaluate_reversion_signal(cfg, df_entry, price, support, resistance)
+        # La reversión se decide únicamente con velas de 15m ya cerradas. La
+        # última fila del feed puede seguir formándose y no confirma rechazo.
+        closed_entry = df_entry.iloc[:-1]
+        if len(closed_entry) < max(cfg.rsi_period + 2, 3):
+            cfg.log.info("Reversión omitida: no hay suficientes velas 15m cerradas.")
+            return None
+        closed_price = float(closed_entry["close"].iloc[-1])
+        closed_htf = df_htf.iloc[:-1]
+        closed_support, closed_resistance = get_nearest_support_resistance(cfg, closed_htf, closed_price)
+        closed_adx_series = compute_adx(closed_htf, cfg.adx_period)
+        closed_adx = float(closed_adx_series.iloc[-1]) if len(closed_adx_series) else current_adx
+        return evaluate_reversion_signal(
+            cfg, closed_entry, closed_price, closed_support, closed_resistance,
+            df_htf=closed_htf, current_adx=closed_adx,
+        )
 
 
 def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
