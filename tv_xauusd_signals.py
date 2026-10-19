@@ -37,7 +37,7 @@ cfg = BotConfig(
     # Las 3 son independientes entre sí — podés apagar cualquier combinación.
     trend_indicator="macd",          # dirección de tendencia via MACD (antes Supertrend, iba mucho en contra)
     reversion_mode_enabled=True,     # entrada por soporte/resistencia + RSI en lateral
-    reversion_range_filter_enabled=True,
+    reversion_range_filter_enabled=False,
     reversion_range_min_atr=2.0,     # evita rangos 4H demasiado estrechos para una reversión útil
     reversion_range_max_atr=8.0,     # evita llamar "lateral" a una estructura excesivamente amplia
     reversion_require_closed_candle_rejection=True,
