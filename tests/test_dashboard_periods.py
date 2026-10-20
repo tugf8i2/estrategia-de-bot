@@ -61,6 +61,27 @@ class DashboardPeriodTests(unittest.TestCase):
         self.assertEqual(data["months"], [])
         self.assertEqual(data["years"], [])
 
+    def test_nas100_reads_its_own_history_and_state_files(self):
+        row = {"cerrada_en": "2026-10-01T13:00:00+00:00", "resultado": "GANADORA", "puntos": "12"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_dir = Path(temp_dir)
+            history = data_dir / "historial_senales_vantage_nas100.csv"
+            with history.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=row.keys())
+                writer.writeheader()
+                writer.writerow(row)
+            state_file = data_dir / "signal_state_vantage_nas100.json"
+            state_file.write_text('{"active": true}', encoding="utf-8")
+
+            with patch.object(dashboard, "DATA_DIR", data_dir), patch.object(
+                dashboard, "STATS_FROM_DATE", ""
+            ):
+                data = dashboard.load_data("nas100")
+
+        self.assertEqual(data["total"], 1)
+        self.assertEqual(data["net"], 12.0)
+        self.assertTrue(data["state"]["active"])
+
 
 if __name__ == "__main__":
     unittest.main()

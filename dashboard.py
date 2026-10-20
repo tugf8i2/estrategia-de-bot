@@ -7,6 +7,7 @@ import os
 from datetime import date, datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 DATA_DIR = Path(os.environ.get("SIGNAL_DATA_DIR", "."))
 HISTORY_FILE = Path(
@@ -76,10 +77,17 @@ def finish_period_bucket(bucket):
     return bucket
 
 
-def load_data():
+def load_data(bot="xauusd"):
+    if bot == "xauusd":
+        history_file, state_file = HISTORY_FILE, STATE_FILE
+    elif bot == "nas100":
+        history_file = DATA_DIR / "historial_senales_vantage_nas100.csv"
+        state_file = DATA_DIR / "signal_state_vantage_nas100.json"
+    else:
+        raise ValueError(f"Instrumento no válido: {bot}")
     rows = []
-    if HISTORY_FILE.exists():
-        with HISTORY_FILE.open("r", encoding="utf-8-sig", newline="") as handle:
+    if history_file.exists():
+        with history_file.open("r", encoding="utf-8-sig", newline="") as handle:
             rows = list(csv.DictReader(handle))
     rows = [row for row in rows if visible_from_baseline(row)]
 
@@ -143,9 +151,9 @@ def load_data():
 
     decided = wins + losses
     state = {"active": False}
-    if STATE_FILE.exists():
+    if state_file.exists():
         try:
-            state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            state = json.loads(state_file.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             pass
 
@@ -182,8 +190,8 @@ main{max-width:1200px;margin:auto}h1{margin:0 0 4px}.sub{color:var(--muted);marg
 .wide{margin-top:14px}canvas{width:100%;height:230px}table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:9px;border-bottom:1px solid var(--line);white-space:nowrap}.scroll{overflow:auto}
 .year-total{background:#202a45;font-weight:700}.year-month td:first-child{padding-left:24px;color:var(--muted)}
 .filters{display:flex;gap:12px;align-items:end;flex-wrap:wrap;margin:12px 0}.field{display:grid;gap:5px}.field label{color:var(--muted);font-size:12px}.field input,.field select,.filters button{background:#0f1628;color:#eef2ff;border:1px solid var(--line);border-radius:9px;padding:9px 11px}.filters button{cursor:pointer}.period-title{font-size:20px;font-weight:750;margin:8px 0 12px}
-.pill{display:inline-block;padding:4px 9px;border-radius:99px;background:#25304c}.active{background:#174d37;color:#8ff0bb}@media(max-width:600px){body{padding:12px}.value{font-size:21px}.field{width:100%}.field input,.field select{width:100%}}
-</style></head><body><main><h1>☕ Coffee Fly</h1><div class="sub">Contabilidad del bot · actualización automática cada 60 segundos · USD estimado con 0,01 lote, sin comisiones ni swaps</div>
+.pill{display:inline-block;padding:4px 9px;border-radius:99px;background:#25304c}.active{background:#174d37;color:#8ff0bb}#botFilter{background:#0f1628;color:#eef2ff;border:1px solid var(--line);border-radius:9px;padding:6px 10px}@media(max-width:600px){body{padding:12px}.value{font-size:21px}.field{width:100%}.field input,.field select{width:100%}}
+</style></head><body><main><h1>☕ Coffee Fly</h1><div class="sub">Contabilidad de <select id="botFilter"><option value="xauusd">XAUUSD</option><option value="nas100">NAS100</option></select> · actualización automática cada 60 segundos · USD estimado con 0,01 lote, sin comisiones ni swaps</div>
 <section class="card wide"><div class="label">Consultar por fecha</div><div class="filters"><div class="field"><label for="dayFilter">Día</label><input id="dayFilter" type="date"></div><div class="field"><label for="monthFilter">Mes</label><input id="monthFilter" type="month"></div><div class="field"><label for="yearFilter">Año</label><select id="yearFilter"><option value="">Todos</option></select></div><button id="currentMonth" type="button">Mes actual</button><button id="clearFilters" type="button">Resumen general</button></div><div class="period-title" id="periodTitle"></div><section class="grid" id="periodCards"></section></section>
 <section class="card wide"><div class="label">Resumen general desde la línea base</div><section class="grid" id="cards"></section></section><section class="card wide"><div class="label">Curva acumulada (puntos)</div><canvas id="curve"></canvas></section>
 <section class="card wide"><div class="label">Rendimiento por estrategia</div><div class="scroll"><table id="strategies"></table></div></section>
@@ -199,7 +207,7 @@ function emptyPeriod(period){return {period,trades:0,wins:0,losses:0,breakeven:0
 let filtersReady=false,lastData=null;
 function renderSelected(d){let day=document.querySelector('#dayFilter').value,month=document.querySelector('#monthFilter').value,year=document.querySelector('#yearFilter').value,p,title;if(day){p=d.days.find(x=>x.period===day)||emptyPeriod(day);title='Resultado del día '+day}else if(month){p=d.months.find(x=>x.period===month)||emptyPeriod(month);title='Resultado del mes '+month}else if(year){p=d.years.find(x=>x.period===year)||emptyPeriod(year);title='Acumulado del año '+year}else{p={trades:d.total,wins:d.wins,losses:d.losses,breakeven:d.breakeven,win_rate:d.win_rate,gross_profit:d.gross_profit,gross_loss:d.gross_loss,net:d.net};title='Resumen general'}document.querySelector('#periodTitle').textContent=title;document.querySelector('#periodCards').innerHTML=summaryCards(p,d)}
 function draw(values){const c=document.querySelector('#curve'),x=c.getContext('2d'),d=devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;c.width=w*d;c.height=h*d;x.scale(d,d);x.clearRect(0,0,w,h);if(!values.length){x.fillStyle='#92a0bb';x.fillText('Todavía no hay operaciones',15,30);return}let min=Math.min(0,...values),max=Math.max(0,...values);if(max===min)max=min+1;x.strokeStyle='#27314c';x.beginPath();x.moveTo(0,h-(0-min)/(max-min)*h);x.lineTo(w,h-(0-min)/(max-min)*h);x.stroke();x.strokeStyle='#35d07f';x.lineWidth=2;x.beginPath();values.forEach((v,i)=>{let px=values.length===1?w/2:i*w/(values.length-1),py=h-10-(v-min)/(max-min)*(h-20);i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}
-async function load(){let d=await fetch('/api/stats').then(r=>r.json());lastData=d;document.querySelector('#cards').innerHTML=card('Estado',d.state.active?'Operación activa':'Esperando señal',d.state.active?'good':'')+card('Operaciones',d.total, '')+card('Ganadas',d.wins,'good')+card('Perdidas',d.losses,'bad')+card('Break-even',d.breakeven)+card('Win rate',n(d.win_rate,1)+'%')+card('Ganancia bruta estimada',n(d.gross_profit)+' pts'+usd(d.gross_profit,d.usd_per_point),'good')+card('Pérdida bruta estimada','-'+n(d.gross_loss)+' pts'+usd(-d.gross_loss,d.usd_per_point),'bad')+card('Neto estimado',n(d.net)+' pts'+usd(d.net,d.usd_per_point),d.net>=0?'good':'bad')+card('Profit factor',d.profit_factor===null?'∞':n(d.profit_factor))+card('Promedio ganada',n(d.avg_win)+' pts'+usd(d.avg_win,d.usd_per_point))+card('Promedio perdida','-'+n(d.avg_loss)+' pts'+usd(-d.avg_loss,d.usd_per_point))+card('Máx. drawdown','-'+n(d.max_drawdown)+' pts'+usd(-d.max_drawdown,d.usd_per_point),'bad');draw(d.curve);
+async function load(){let bot=document.querySelector('#botFilter').value;let d=await fetch('/api/stats?bot='+encodeURIComponent(bot)).then(r=>r.json());lastData=d;document.querySelector('#cards').innerHTML=card('Estado',d.state.active?'Operación activa':'Esperando señal',d.state.active?'good':'')+card('Operaciones',d.total, '')+card('Ganadas',d.wins,'good')+card('Perdidas',d.losses,'bad')+card('Break-even',d.breakeven)+card('Win rate',n(d.win_rate,1)+'%')+card('Ganancia bruta estimada',n(d.gross_profit)+' pts'+usd(d.gross_profit,d.usd_per_point),'good')+card('Pérdida bruta estimada','-'+n(d.gross_loss)+' pts'+usd(-d.gross_loss,d.usd_per_point),'bad')+card('Neto estimado',n(d.net)+' pts'+usd(d.net,d.usd_per_point),d.net>=0?'good':'bad')+card('Profit factor',d.profit_factor===null?'∞':n(d.profit_factor))+card('Promedio ganada',n(d.avg_win)+' pts'+usd(d.avg_win,d.usd_per_point))+card('Promedio perdida','-'+n(d.avg_loss)+' pts'+usd(-d.avg_loss,d.usd_per_point))+card('Máx. drawdown','-'+n(d.max_drawdown)+' pts'+usd(-d.max_drawdown,d.usd_per_point),'bad');draw(d.curve);
 if(!filtersReady){document.querySelector('#monthFilter').value=d.current_period.month;document.querySelector('#yearFilter').innerHTML='<option value="">Todos</option>'+d.years.map(y=>`<option value="${y.period}">${y.period}</option>`).join('');filtersReady=true}renderSelected(d);
 let ss=Object.entries(d.strategies).map(([k,v])=>`<tr><td>${k}</td><td>${v.trades}</td><td class="good">${v.wins}</td><td class="bad">${v.losses}</td><td>${n(v.points)}</td></tr>`).join('');document.querySelector('#strategies').innerHTML='<tr><th>Estrategia</th><th>Total</th><th>Ganadas</th><th>Perdidas</th><th>Puntos</th></tr>'+ss;
 const periodRow=(p,label,extra='')=>`<tr class="${extra}"><td>${label}</td><td>${p.trades}</td><td class="good">${p.wins}</td><td class="bad">${p.losses}</td><td>${p.breakeven}</td><td>${n(p.win_rate,1)}%</td><td class="good">${n(p.gross_profit)} pts${usd(p.gross_profit,d.usd_per_point)}</td><td class="bad">-${n(p.gross_loss)} pts${usd(-p.gross_loss,d.usd_per_point)}</td><td class="${p.net>=0?'good':'bad'}">${n(p.net)} pts${usd(p.net,d.usd_per_point)}</td></tr>`;
@@ -207,7 +215,7 @@ const periodHead='<tr><th>Periodo</th><th>Total</th><th>Ganadas</th><th>Perdidas
 document.querySelector('#months').innerHTML=periodHead+d.months.map(m=>periodRow(m,m.period)).join('');
 document.querySelector('#years').innerHTML=periodHead+d.years.map(y=>periodRow(y,y.period,'year-total')+y.months.map(m=>periodRow(m,'↳ '+m.period,'year-month')).join('')).join('');
 let ts=d.rows.map(r=>`<tr><td>${r.cerrada_en||''}</td><td>${r.side||''}</td><td>${r.resultado||''}</td><td>${r.entrada||''}</td><td>${r.salida||''}</td><td>${r.puntos||''} pts${usd(r.puntos,d.usd_per_point)}</td><td>${r.estrategia||''}</td><td>${r.adx_4h||''}</td><td>${r.rango_4h_atr||''}</td><td>${r.razon_entrada||''}</td></tr>`).join('');document.querySelector('#trades').innerHTML='<tr><th>Cierre</th><th>Lado</th><th>Resultado</th><th>Entrada</th><th>Salida</th><th>Puntos · USD estimado</th><th>Estrategia</th><th>ADX 4H</th><th>Rango 4H/ATR</th><th>Razón de entrada</th></tr>'+ts}
-const day=document.querySelector('#dayFilter'),month=document.querySelector('#monthFilter'),year=document.querySelector('#yearFilter');day.addEventListener('change',()=>{if(day.value){month.value='';year.value=''}renderSelected(lastData)});month.addEventListener('change',()=>{if(month.value){day.value='';year.value=''}renderSelected(lastData)});year.addEventListener('change',()=>{if(year.value){day.value='';month.value=''}renderSelected(lastData)});document.querySelector('#currentMonth').addEventListener('click',()=>{day.value='';year.value='';month.value=lastData.current_period.month;renderSelected(lastData)});document.querySelector('#clearFilters').addEventListener('click',()=>{day.value='';month.value='';year.value='';renderSelected(lastData)});load();setInterval(load,60000);addEventListener('resize',()=>draw(lastData?lastData.curve:[]))
+const day=document.querySelector('#dayFilter'),month=document.querySelector('#monthFilter'),year=document.querySelector('#yearFilter');document.querySelector('#botFilter').addEventListener('change',()=>{filtersReady=false;day.value='';month.value='';year.value='';load()});day.addEventListener('change',()=>{if(day.value){month.value='';year.value=''}renderSelected(lastData)});month.addEventListener('change',()=>{if(month.value){day.value='';year.value=''}renderSelected(lastData)});year.addEventListener('change',()=>{if(year.value){day.value='';month.value=''}renderSelected(lastData)});document.querySelector('#currentMonth').addEventListener('click',()=>{day.value='';year.value='';month.value=lastData.current_period.month;renderSelected(lastData)});document.querySelector('#clearFilters').addEventListener('click',()=>{day.value='';month.value='';year.value='';renderSelected(lastData)});load();setInterval(load,60000);addEventListener('resize',()=>draw(lastData?lastData.curve:[]))
 </script></body></html>'''
 
 
@@ -216,8 +224,13 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             body = b'{"status":"ok"}'
             content_type = "application/json; charset=utf-8"
-        elif self.path == "/api/stats":
-            body = json.dumps(load_data(), ensure_ascii=False, default=str).encode()
+        elif urlparse(self.path).path == "/api/stats":
+            query = parse_qs(urlparse(self.path).query)
+            bot = query.get("bot", ["xauusd"])[0]
+            if bot not in ("xauusd", "nas100"):
+                self.send_error(400, "Instrumento no válido")
+                return
+            body = json.dumps(load_data(bot), ensure_ascii=False, default=str).encode()
             content_type = "application/json; charset=utf-8"
         elif self.path in ("/", "/index.html"):
             body = HTML.encode()
