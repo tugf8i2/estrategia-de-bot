@@ -116,13 +116,15 @@ class BotConfig:
     liquidity_zone_tolerance_pct: float = 0.002
     liquidity_lookback_candles: int = 5
 
-    # --- Break-even automático: no evita señales perdedoras, cambia el costo de un
-    # barrido de stop DESPUÉS de ir ganando. Al avanzar breakeven_trigger_pct del
-    # camino hacia el TP, el SL se mueve a un porcentaje configurado de ese
-    # mismo recorrido. No afecta señales que van directo al SL.
+    # --- Protección escalonada: no evita señales que van directo al SL.
+    # Al 40% del recorrido hacia TP, protege una ganancia pequeña (1% del recorrido).
+    # Al 80%, asegura el 50% del recorrido. Cada etapa aplica desde la vela siguiente
+    # a su activación, porque el OHLC de una vela no permite ordenar sus extremos.
     breakeven_enabled: bool = True
-    breakeven_trigger_pct: float = 0.9  # a qué % del camino hacia el TP se activa
-    breakeven_lock_pct: float = 0.5     # a qué % del camino hacia el TP se mueve el SL
+    breakeven_stage1_trigger_pct: float = 0.40
+    breakeven_stage1_lock_pct: float = 0.01
+    breakeven_stage2_trigger_pct: float = 0.80
+    breakeven_stage2_lock_pct: float = 0.50
 
     # --- Supertrend (se deja disponible por si querés volver a esto con trend_indicator="supertrend") ---
     supertrend_entry_enabled: bool = True
@@ -1338,8 +1340,7 @@ def evaluate_new_signal(cfg: BotConfig, symbol: str):
 
 
 def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
-    """Revisa si TP o SL se tocaron EN ALGÚN MOMENTO desde que se abrió la señal
-    (no solo el precio actual), usando el high/low de las velas finas."""
+    """Revisa TP/SL por velas finas y aplica protección escalonada virtual."""
     side = state["side"]
     tp = state["tp"]
     sl = state["sl"]
@@ -1351,101 +1352,91 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
     elapsed_minutes = max(1, int((now - opened_at).total_seconds() / 60))
     interval_minutes = {"1": 1, "3": 3, "5": 5, "15": 15, "30": 30, "60": 60}.get(cfg.monitor_interval, 1)
     bars_needed = min(3000, elapsed_minutes // interval_minutes + 20)
-
     df = get_klines(cfg, symbol, cfg.monitor_interval, limit=bars_needed)
     df_since_open = df[df["start"] >= opened_at]
 
     if not df.empty and df["start"].iloc[0] > opened_at:
-        cfg.log.warning(
-            "La señal lleva abierta más tiempo del que cubren las %d velas traídas; "
-            "puede haber quedado un tramo inicial sin revisar (mecha no detectada).",
-            bars_needed,
-        )
-
+        cfg.log.warning("La señal puede tener un tramo inicial sin revisar (mecha no detectada).")
     if df_since_open.empty:
         price = get_last_price(cfg, symbol)
         df_since_open = pd.DataFrame([{"start": now, "open": price, "high": price, "low": price, "close": price}])
 
-    result = None
-    trigger_time = None
-    exit_price = float(df_since_open["close"].iloc[-1])
     entry = state["entry"]
-
-    # Al avanzar hasta el umbral configurado, asegura un porcentaje del
-    # recorrido entrada->TP. El cálculo relativo funciona igual en LONG/SHORT.
     reward_total = tp - entry
-    locked_sl = entry + cfg.breakeven_lock_pct * reward_total
+    stage1_sl = entry + cfg.breakeven_stage1_lock_pct * reward_total
+    stage2_sl = entry + cfg.breakeven_stage2_lock_pct * reward_total
 
-    breakeven_time = None
-    if state.get("breakeven_time"):
-        breakeven_time = pd.Timestamp(state["breakeven_time"])
-        if breakeven_time.tzinfo is None:
-            breakeven_time = breakeven_time.tz_localize("UTC")
-    elif cfg.breakeven_enabled and not state.get("breakeven_triggered", False):
-        trigger_price = entry + cfg.breakeven_trigger_pct * reward_total
-        if side == "LONG":
-            be_hits = df_since_open[df_since_open["high"] >= trigger_price]
-        else:
-            be_hits = df_since_open[df_since_open["low"] <= trigger_price]
-        if not be_hits.empty:
-            breakeven_time = be_hits["start"].iloc[0]
-            state["breakeven_triggered"] = True
-            state["breakeven_time"] = breakeven_time.isoformat()
-            save_state(cfg, state)
-            cfg.log.info(
-                "Protección activada: SL movido a %.2f (%.0f%% del camino; entrada=%.2f, tp=%.2f) desde %s",
-                locked_sl, cfg.breakeven_lock_pct * 100, entry, tp, breakeven_time,
-            )
+    def find_or_restore_stage(stage_name, trigger_pct):
+        stored = state.get(stage_name)
+        if stored:
+            value = pd.Timestamp(stored)
+            return value.tz_localize("UTC") if value.tzinfo is None else value
+        trigger_price = entry + trigger_pct * reward_total
+        hits = (
+            df_since_open[df_since_open["high"] >= trigger_price]
+            if side == "LONG"
+            else df_since_open[df_since_open["low"] <= trigger_price]
+        )
+        if hits.empty:
+            return None
+        value = hits["start"].iloc[0]
+        state[stage_name] = value.isoformat()
+        return value
 
-    if breakeven_time is not None:
-        before = df_since_open[df_since_open["start"] < breakeven_time]
-        after = df_since_open[df_since_open["start"] >= breakeven_time]
-        # El SL movido (=entrada + colchón) solo protege desde la vela
-        # SIGUIENTE a la que activó el break-even — en la misma vela no
-        # podemos saber si el mínimo ocurrió antes o después del máximo que
-        # disparó el break-even.
-        after_for_sl = df_since_open[df_since_open["start"] > breakeven_time]
+    stage1_time = find_or_restore_stage("breakeven_stage1_time", cfg.breakeven_stage1_trigger_pct) if cfg.breakeven_enabled else None
+    stage2_time = find_or_restore_stage("breakeven_stage2_time", cfg.breakeven_stage2_trigger_pct) if cfg.breakeven_enabled else None
+    if stage1_time is not None or stage2_time is not None:
+        save_state(cfg, state)
+    if stage1_time is not None and not state.get("breakeven_stage1_logged"):
+        state["breakeven_stage1_logged"] = True
+        save_state(cfg, state)
+        cfg.log.info("Protección etapa 1: SL virtual a %.2f (%.0f%% del recorrido) desde %s", stage1_sl, cfg.breakeven_stage1_lock_pct * 100, stage1_time)
+    if stage2_time is not None and not state.get("breakeven_stage2_logged"):
+        state["breakeven_stage2_logged"] = True
+        save_state(cfg, state)
+        cfg.log.info("Protección etapa 2: SL virtual a %.2f (%.0f%% del recorrido) desde %s", stage2_sl, cfg.breakeven_stage2_lock_pct * 100, stage2_time)
+
+    # La protección de una etapa empieza en la vela POSTERIOR a su disparo.
+    # En la vela que dispara una etapa se conserva el stop que venía vigente.
+    if stage1_time is None:
+        initial_window = df_since_open
+        stage1_window = df_since_open.iloc[0:0]
+        stage2_window = df_since_open.iloc[0:0]
+    elif stage2_time is None:
+        initial_window = df_since_open[df_since_open["start"] <= stage1_time]
+        stage1_window = df_since_open[df_since_open["start"] > stage1_time]
+        stage2_window = df_since_open.iloc[0:0]
     else:
-        before = df_since_open
-        after = df_since_open.iloc[0:0]
-        after_for_sl = df_since_open.iloc[0:0]
+        initial_window = df_since_open[df_since_open["start"] <= stage1_time]
+        stage1_window = df_since_open[(df_since_open["start"] > stage1_time) & (df_since_open["start"] <= stage2_time)]
+        stage2_window = df_since_open[df_since_open["start"] > stage2_time]
 
     if side == "LONG":
-        tp_hits = pd.concat([before[before["high"] >= tp], after[after["high"] >= tp]])
-        sl_hits_before = before[before["low"] <= sl]
-        sl_hits_after = after_for_sl[after_for_sl["low"] <= locked_sl]
+        tp_hits = df_since_open[df_since_open["high"] >= tp]
+        initial_sl_hits = initial_window[initial_window["low"] <= sl]
+        stage1_sl_hits = stage1_window[stage1_window["low"] <= stage1_sl]
+        stage2_sl_hits = stage2_window[stage2_window["low"] <= stage2_sl]
     else:
-        tp_hits = pd.concat([before[before["low"] <= tp], after[after["low"] <= tp]])
-        sl_hits_before = before[before["high"] >= sl]
-        sl_hits_after = after_for_sl[after_for_sl["high"] >= locked_sl]
+        tp_hits = df_since_open[df_since_open["low"] <= tp]
+        initial_sl_hits = initial_window[initial_window["high"] >= sl]
+        stage1_sl_hits = stage1_window[stage1_window["high"] >= stage1_sl]
+        stage2_sl_hits = stage2_window[stage2_window["high"] >= stage2_sl]
 
-    first_tp_time = tp_hits["start"].iloc[0] if not tp_hits.empty else None
-    first_sl_before_time = sl_hits_before["start"].iloc[0] if not sl_hits_before.empty else None
-    first_sl_after_time = sl_hits_after["start"].iloc[0] if not sl_hits_after.empty else None
-
-    # Elegimos el evento que ocurrió PRIMERO en el tiempo entre los 3 posibles
-    # (TP, SL original antes del break-even, SL=entrada+colchón después del
-    # break-even). En empate exacto de horario, el TP tiene prioridad (igual
-    # que antes).
     candidates = []
-    if first_tp_time is not None:
-        candidates.append(("GANADORA (TP)", first_tp_time, tp, 0))
-    if first_sl_before_time is not None:
-        candidates.append(("PERDEDORA (SL)", first_sl_before_time, sl, 1))
-    if first_sl_after_time is not None:
-        candidates.append((
-            f"GANADORA (PROTECCIÓN, SL asegurado al {cfg.breakeven_lock_pct*100:.0f}% del camino)",
-            first_sl_after_time, locked_sl, 1,
-        ))
+    if not tp_hits.empty:
+        candidates.append(("GANADORA (TP)", tp_hits["start"].iloc[0], tp, 0))
+    if not initial_sl_hits.empty:
+        candidates.append(("PERDEDORA (SL)", initial_sl_hits["start"].iloc[0], sl, 1))
+    if not stage1_sl_hits.empty:
+        candidates.append(("GANADORA (PROTECCIÓN ETAPA 1)", stage1_sl_hits["start"].iloc[0], stage1_sl, 1))
+    if not stage2_sl_hits.empty:
+        candidates.append(("GANADORA (PROTECCIÓN ETAPA 2)", stage2_sl_hits["start"].iloc[0], stage2_sl, 1))
+    if not candidates:
+        return None, float(df_since_open["close"].iloc[-1])
 
-    if candidates:
-        candidates.sort(key=lambda c: (c[1], c[3]))  # por tiempo, y TP gana empates
-        result, trigger_time, exit_price, _ = candidates[0]
-
-    if result:
-        cfg.log.info("Señal %s tocó %s en la vela de %s (detectado por high/low, no solo el cierre)",
-                      side, result, trigger_time)
-
+    candidates.sort(key=lambda candidate: (candidate[1], candidate[3]))
+    result, trigger_time, exit_price, _ = candidates[0]
+    cfg.log.info("Señal %s tocó %s en la vela de %s", side, result, trigger_time)
     return result, exit_price
 
 
