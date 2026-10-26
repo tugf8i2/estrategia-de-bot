@@ -116,15 +116,12 @@ class BotConfig:
     liquidity_zone_tolerance_pct: float = 0.002
     liquidity_lookback_candles: int = 5
 
-    # --- Protección escalonada: no evita señales que van directo al SL.
-    # Al 40% del recorrido hacia TP, protege una ganancia pequeña (1% del recorrido).
-    # Al 80%, asegura el 50% del recorrido. Cada etapa aplica desde la vela siguiente
-    # a su activación, porque el OHLC de una vela no permite ordenar sus extremos.
+    # --- Protección única: no evita señales que van directo al SL.
+    # Al 90% del recorrido hacia TP, asegura el 50% del recorrido.
+    # El stop protegido aplica desde la vela siguiente a su activación.
     breakeven_enabled: bool = True
-    breakeven_stage1_trigger_pct: float = 0.40
-    breakeven_stage1_lock_pct: float = 0.01
-    breakeven_stage2_trigger_pct: float = 0.80
-    breakeven_stage2_lock_pct: float = 0.50
+    breakeven_trigger_pct: float = 0.90
+    breakeven_lock_pct: float = 0.50
 
     # --- Supertrend (se deja disponible por si querés volver a esto con trend_indicator="supertrend") ---
     supertrend_entry_enabled: bool = True
@@ -1340,7 +1337,7 @@ def evaluate_new_signal(cfg: BotConfig, symbol: str):
 
 
 def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
-    """Revisa TP/SL por velas finas y aplica protección escalonada virtual."""
+    """Revisa TP/SL por velas finas y aplica una única protección virtual."""
     side = state["side"]
     tp = state["tp"]
     sl = state["sl"]
@@ -1363,74 +1360,52 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
 
     entry = state["entry"]
     reward_total = tp - entry
-    stage1_sl = entry + cfg.breakeven_stage1_lock_pct * reward_total
-    stage2_sl = entry + cfg.breakeven_stage2_lock_pct * reward_total
+    locked_sl = entry + cfg.breakeven_lock_pct * reward_total
+    breakeven_time = None
 
-    def find_or_restore_stage(stage_name, trigger_pct):
-        stored = state.get(stage_name)
-        if stored:
-            value = pd.Timestamp(stored)
-            return value.tz_localize("UTC") if value.tzinfo is None else value
-        trigger_price = entry + trigger_pct * reward_total
+    if state.get("breakeven_time"):
+        breakeven_time = pd.Timestamp(state["breakeven_time"])
+        if breakeven_time.tzinfo is None:
+            breakeven_time = breakeven_time.tz_localize("UTC")
+    elif cfg.breakeven_enabled:
+        trigger_price = entry + cfg.breakeven_trigger_pct * reward_total
         hits = (
             df_since_open[df_since_open["high"] >= trigger_price]
             if side == "LONG"
             else df_since_open[df_since_open["low"] <= trigger_price]
         )
-        if hits.empty:
-            return None
-        value = hits["start"].iloc[0]
-        state[stage_name] = value.isoformat()
-        return value
+        if not hits.empty:
+            breakeven_time = hits["start"].iloc[0]
+            state["breakeven_triggered"] = True
+            state["breakeven_time"] = breakeven_time.isoformat()
+            save_state(cfg, state)
+            cfg.log.info("Protección activada: SL virtual a %.2f (50%% del recorrido) desde %s", locked_sl, breakeven_time)
 
-    stage1_time = find_or_restore_stage("breakeven_stage1_time", cfg.breakeven_stage1_trigger_pct) if cfg.breakeven_enabled else None
-    stage2_time = find_or_restore_stage("breakeven_stage2_time", cfg.breakeven_stage2_trigger_pct) if cfg.breakeven_enabled else None
-    if stage1_time is not None or stage2_time is not None:
-        save_state(cfg, state)
-    if stage1_time is not None and not state.get("breakeven_stage1_logged"):
-        state["breakeven_stage1_logged"] = True
-        save_state(cfg, state)
-        cfg.log.info("Protección etapa 1: SL virtual a %.2f (%.0f%% del recorrido) desde %s", stage1_sl, cfg.breakeven_stage1_lock_pct * 100, stage1_time)
-    if stage2_time is not None and not state.get("breakeven_stage2_logged"):
-        state["breakeven_stage2_logged"] = True
-        save_state(cfg, state)
-        cfg.log.info("Protección etapa 2: SL virtual a %.2f (%.0f%% del recorrido) desde %s", stage2_sl, cfg.breakeven_stage2_lock_pct * 100, stage2_time)
-
-    # La protección de una etapa empieza en la vela POSTERIOR a su disparo.
-    # En la vela que dispara una etapa se conserva el stop que venía vigente.
-    if stage1_time is None:
+    # El stop protegido comienza en la vela posterior al disparo; en la vela
+    # de disparo continúa vigente el SL original por la ambigüedad del OHLC.
+    if breakeven_time is None:
         initial_window = df_since_open
-        stage1_window = df_since_open.iloc[0:0]
-        stage2_window = df_since_open.iloc[0:0]
-    elif stage2_time is None:
-        initial_window = df_since_open[df_since_open["start"] <= stage1_time]
-        stage1_window = df_since_open[df_since_open["start"] > stage1_time]
-        stage2_window = df_since_open.iloc[0:0]
+        protected_window = df_since_open.iloc[0:0]
     else:
-        initial_window = df_since_open[df_since_open["start"] <= stage1_time]
-        stage1_window = df_since_open[(df_since_open["start"] > stage1_time) & (df_since_open["start"] <= stage2_time)]
-        stage2_window = df_since_open[df_since_open["start"] > stage2_time]
+        initial_window = df_since_open[df_since_open["start"] <= breakeven_time]
+        protected_window = df_since_open[df_since_open["start"] > breakeven_time]
 
     if side == "LONG":
         tp_hits = df_since_open[df_since_open["high"] >= tp]
         initial_sl_hits = initial_window[initial_window["low"] <= sl]
-        stage1_sl_hits = stage1_window[stage1_window["low"] <= stage1_sl]
-        stage2_sl_hits = stage2_window[stage2_window["low"] <= stage2_sl]
+        protected_sl_hits = protected_window[protected_window["low"] <= locked_sl]
     else:
         tp_hits = df_since_open[df_since_open["low"] <= tp]
         initial_sl_hits = initial_window[initial_window["high"] >= sl]
-        stage1_sl_hits = stage1_window[stage1_window["high"] >= stage1_sl]
-        stage2_sl_hits = stage2_window[stage2_window["high"] >= stage2_sl]
+        protected_sl_hits = protected_window[protected_window["high"] >= locked_sl]
 
     candidates = []
     if not tp_hits.empty:
         candidates.append(("GANADORA (TP)", tp_hits["start"].iloc[0], tp, 0))
     if not initial_sl_hits.empty:
         candidates.append(("PERDEDORA (SL)", initial_sl_hits["start"].iloc[0], sl, 1))
-    if not stage1_sl_hits.empty:
-        candidates.append(("GANADORA (PROTECCIÓN ETAPA 1)", stage1_sl_hits["start"].iloc[0], stage1_sl, 1))
-    if not stage2_sl_hits.empty:
-        candidates.append(("GANADORA (PROTECCIÓN ETAPA 2)", stage2_sl_hits["start"].iloc[0], stage2_sl, 1))
+    if not protected_sl_hits.empty:
+        candidates.append(("GANADORA (PROTECCIÓN AL 50%)", protected_sl_hits["start"].iloc[0], locked_sl, 1))
     if not candidates:
         return None, float(df_since_open["close"].iloc[-1])
 
