@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-Bot de señales — VANTAGE:NAS100 (Nasdaq 100), SOLO estrategia de REVERSIÓN
+Bot de señales — VANTAGE:NAS100FT (Nasdaq 100)
 
-Usa el mismo motor que el bot de oro (signal_bot_core.py), sin cambios en el
-núcleo. Aquí se apaga el modo tendencia (trend_mode_enabled=False), así que el
-bot siempre evalúa la reversión: soporte/resistencia de 4H + RSI de 15m con
-confirmación de giro + rechazo en vela cerrada.
+Estrategia ÚNICA: zonas de soporte/resistencia en 4H + gatillo RSI(14) en 15m.
 
-Nota: el bot lee el símbolo (VANTAGE:NAS100), no tu layout guardado de
-TradingView. Lo que pongas en el gráfico no cambia las señales; cambian los
-parámetros de abajo.
+  VENTA:  precio dentro de zona de RESISTENCIA y RSI 15m > 70
+  COMPRA: precio dentro de zona de SOPORTE   y RSI 15m < 30
 
-⚠️ tp_points y sl_buffer_points_fallback son los valores base del núcleo para
-NAS100 (~28,000 puntos). Son un punto de partida, NO un valor probado.
-Ajústalos con la bitácora (`python tv_nas100_signals.py stats`).
-
-⚠️ Esta reversión no está validada con un backtest. Úsala primero solo para
-avisos y revisa los resultados antes de activar cualquier auto-trading.
+  - Si el RSI 4H < 40 se cancelan las COMPRAS.
+  - Si el precio ya tocó o penetró la zona pero el RSI aún no coincide, la zona
+    queda armada y el bot espera a que el RSI coincida para entrar.
+  - TP = 110 y SL = 100 puntos, fijos. Protección: al llegar al 90% del camino
+    hacia el TP, el SL sube al 50% de ese recorrido.
 
 Uso:
     python tv_nas100_signals.py           -> corre el bot en vivo
@@ -27,36 +22,42 @@ Uso:
 from signal_bot_core import BotConfig, run_cli
 
 cfg = BotConfig(
-    tv_symbol="VANTAGE:NAS100",
+    tv_symbol="VANTAGE:NAS100FT",   # fuente de las velas
     label="NAS100",
 
-    # TP/SL en puntos de NAS100. El SL real lo define el ATR (atr_sl_multiplier);
-    # sl_buffer_points_fallback solo se usa si el ATR no se puede calcular.
+    sr_interval="240",      # 4H: zonas S/R y RSI de filtro
+    entry_interval="15",    # 15m: gatillo RSI
+    rsi_period=14,          # RSI 14 en 15m y 4H
+    rsi_oversold=30.0,
+    rsi_overbought=70.0,
+
+    zone_rsi_mode_enabled=True,
+    htf_rsi_buy_block_below=40.0,
+
+    # TP/SL fijos en puntos desde la entrada
+    fixed_tp_sl_enabled=True,
     tp_points=110.0,
-    sl_buffer_points_fallback=40.0,
+    sl_points=100.0,
 
-    # --- Solo reversión ---
-    # Con trend_mode_enabled=False el bot nunca entra en modo tendencia:
-    # siempre busca reversión en soporte/resistencia, aunque haya tendencia.
+    # Protección: a 90% del camino al TP, el SL sube al 50% del recorrido
+    breakeven_enabled=True,
+    breakeven_trigger_pct=0.9,
+    breakeven_lock_pct=0.5,
+
+    # Reglas anteriores apagadas
     trend_mode_enabled=False,
-    reversion_mode_enabled=True,
-    reversion_range_filter_enabled=False,
-    reversion_range_min_atr=2.0,
-    reversion_range_max_atr=8.0,
-    reversion_require_closed_candle_rejection=True,
-
-    # Apagados porque pertenecen al modo tendencia (sin efecto con
-    # trend_mode_enabled=False, se dejan explícitos para que se vea).
+    reversion_mode_enabled=False,
     supertrend_entry_enabled=False,
     macd_bb_entry_enabled=False,
     engulfing_mode_enabled=False,
+    adx_filter_enabled=False,
+    min_candle_body_filter_enabled=False,
+    liquidity_filter_enabled=False,
 
-    # --- Auto-trading en Vantage vía MT5 (APAGADO por defecto — el bot solo avisa) ---
+    # Auto-trading MT5 (APAGADO: el bot solo avisa)
     mt5_trading_enabled=False,
-    # Verifica el nombre exacto en el Market Watch de tu MT5 (puede ser "NAS100",
-    # "NAS100+", etc.). Mientras mt5_trading_enabled=False no se usa.
     mt5_symbol="NAS100+",
-    mt5_lot_size=0.10,  # ajústalo a tu cuenta (0.01=micro, 0.10=mini, 1.0=estándar)
+    mt5_lot_size=0.10,
 )
 
 if __name__ == "__main__":

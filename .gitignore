@@ -7,3 +7,4 @@ __pycache__/
 .env
 signal_state_*.json
 historial_senales_*.csv
+estado_nas100_diario.json

@@ -64,13 +64,21 @@ class BotConfig:
     rsi_period: int = 14
     rsi_oversold: float = 30.0
     rsi_overbought: float = 70.0
-    rsi_dynamic_enabled: bool = True
-    rsi_percentile_window: int = 200
-    rsi_oversold_percentile: float = 20.0
-    rsi_overbought_percentile: float = 80.0
-    rsi_oversold_max_cap: float = 35.0
-    rsi_overbought_min_cap: float = 65.0
+    # Campos que evaluate_reversion_signal ya leía pero no estaban definidos (daban AttributeError)
+    rsi_dynamic_enabled: bool = False
     rsi_require_turn_confirmation: bool = True
+    rsi_percentile_window: int = 100
+    rsi_oversold_percentile: float = 10.0
+    rsi_overbought_percentile: float = 90.0
+    rsi_oversold_max_cap: float = 30.0
+    rsi_overbought_min_cap: float = 70.0
+
+    # --- Estrategia "zonas S/R 4H + RSI 15m" (reemplaza al resto cuando está activa) ---
+    zone_rsi_mode_enabled: bool = False
+    htf_rsi_buy_block_below: float = 40.0   # RSI 4H por debajo de esto -> se cancelan las COMPRAS
+    zone_release_pct: float = 0.01          # zona tocada/penetrada se "arma" y espera al RSI; se suelta si el precio se aleja más de este % del nivel
+    fixed_tp_sl_enabled: bool = False       # TP/SL fijos en puntos desde la entrada
+    sl_points: float = 100.0
 
     # --- Soporte/Resistencia (modo reversión) ---
     sr_lookback_candles: int = 150
@@ -498,6 +506,7 @@ def compute_rsi(closes: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.where(~((avg_loss == 0) & (avg_gain > 0)), 100.0)  # solo subidas -> RSI 100 (antes quedaba en 50)
     return rsi.fillna(50)
 
 
@@ -1263,12 +1272,96 @@ def evaluate_engulfing_signal(cfg: BotConfig, symbol: str, support, resistance, 
     }
 
 
+def _zones_path(cfg: BotConfig) -> str:
+    base = cfg.state_file[:-5] if cfg.state_file.endswith(".json") else cfg.state_file
+    return base + "_zonas.json"
+
+
+def _load_zones(cfg: BotConfig) -> dict:
+    try:
+        with open(_zones_path(cfg), "r", encoding="utf-8") as f:
+            z = json.load(f)
+        return {"support": z.get("support"), "resistance": z.get("resistance")}
+    except Exception:
+        return {"support": None, "resistance": None}
+
+
+def _save_zones(cfg: BotConfig, zones: dict):
+    with open(_zones_path(cfg), "w", encoding="utf-8") as f:
+        json.dump(zones, f, indent=2)
+
+
+def evaluate_zone_rsi_signal(cfg: BotConfig, closed_entry, closed_htf, rsi_htf):
+    """Zonas S/R de 4H + gatillo RSI(14) de 15m.
+    VENTA: precio en zona de resistencia y RSI15 > 70.
+    COMPRA: precio en zona de soporte y RSI15 < 30, salvo RSI 4H < 40 (compras canceladas).
+    Si el precio ya tocó/penetró la zona pero el RSI aún no coincide, la zona queda
+    'armada' y espera a que el RSI coincida."""
+    price = float(closed_entry["close"].iloc[-1])
+    rsi15 = float(compute_rsi(closed_entry["close"], cfg.rsi_period).iloc[-1])
+    support, resistance = get_nearest_support_resistance(cfg, closed_htf, price)
+    tol = cfg.proximity_tolerance_pct
+    recent = closed_entry.tail(cfg.touch_lookback_candles)
+
+    zones = _load_zones(cfg)
+    if support is not None and float(recent["low"].min()) <= support * (1 + tol):
+        zones["support"] = float(support)
+    if resistance is not None and float(recent["high"].max()) >= resistance * (1 - tol):
+        zones["resistance"] = float(resistance)
+    for k in ("support", "resistance"):
+        lvl = zones[k]
+        if lvl is not None and abs(price - lvl) / lvl > cfg.zone_release_pct:
+            zones[k] = None  # el precio se alejó: la zona deja de esperar
+
+    buy_blocked = rsi_htf < cfg.htf_rsi_buy_block_below
+    cfg.log.info(
+        "[ZONAS+RSI] Precio=%.2f | RSI15=%.1f | RSI4H=%.1f%s | zona soporte armada=%s | zona resistencia armada=%s",
+        price, rsi15, rsi_htf, " (COMPRAS CANCELADAS)" if buy_blocked else "",
+        f"{zones['support']:.2f}" if zones["support"] else "no",
+        f"{zones['resistance']:.2f}" if zones["resistance"] else "no",
+    )
+
+    side = level = None
+    if zones["resistance"] is not None and rsi15 > cfg.rsi_overbought:
+        side, level = "SHORT", zones["resistance"]
+    elif zones["support"] is not None and rsi15 < cfg.rsi_oversold and not buy_blocked:
+        side, level = "LONG", zones["support"]
+
+    if side is None:
+        _save_zones(cfg, zones)
+        return None
+
+    zones["resistance" if side == "SHORT" else "support"] = None
+    _save_zones(cfg, zones)
+    if side == "LONG":
+        tp, sl = price + cfg.tp_points, price - cfg.sl_points
+    else:
+        tp, sl = price - cfg.tp_points, price + cfg.sl_points
+    return {
+        "side": side, "entry": price, "support_ref": support, "resistance_ref": resistance,
+        "tp": tp, "sl": sl, "rsi": rsi15, "rr": round(cfg.tp_points / cfg.sl_points, 2),
+        "rr_ajustado": False, "estrategia": "zonas_rsi",
+        "adx_4h": None, "rango_4h_atr": None, "rechazo_nivel": level,
+        "razon_entrada": f"precio en zona {'resistencia' if side == 'SHORT' else 'soporte'} {level:.2f}; RSI15={rsi15:.1f}; RSI4H={rsi_htf:.1f}",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def evaluate_new_signal(cfg: BotConfig, symbol: str):
     df_entry = get_klines(cfg, symbol, cfg.entry_interval, limit=200)
     price = float(df_entry["close"].iloc[-1])
 
     df_htf = get_klines(cfg, symbol, cfg.sr_interval, limit=cfg.sr_lookback_candles)
     support, resistance = get_nearest_support_resistance(cfg, df_htf, price)
+
+    if cfg.zone_rsi_mode_enabled:
+        closed_entry = df_entry.iloc[:-1]
+        closed_htf = df_htf.iloc[:-1]
+        if len(closed_entry) < cfg.rsi_period + 2 or len(closed_htf) < cfg.rsi_period + 2:
+            cfg.log.info("Zonas+RSI omitido: no hay suficientes velas.")
+            return None
+        rsi_htf = float(compute_rsi(df_htf["close"], cfg.rsi_period).iloc[-1])
+        return evaluate_zone_rsi_signal(cfg, closed_entry, closed_htf, rsi_htf)
 
     regime_direction = None
     current_adx = None
@@ -1455,6 +1548,7 @@ def check_active_signal(cfg: BotConfig, symbol: str, state: dict):
 
 ESTRATEGIA_LABELS = {
     "reversion_sr_rsi": "📉 Reversión (S/R + RSI)",
+    "zonas_rsi": "📍 Zonas S/R 4H + RSI 15m",
     "tendencia_supertrend": "📈 Tendencia (Supertrend)",
     "tendencia_macd_bb": "📊 Tendencia (MACD + Bollinger)",
     "tendencia_engulfing_2m": "🕯️ Tendencia (Envolvente)",

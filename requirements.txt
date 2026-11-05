@@ -10,3 +10,4 @@ tzdata==2026.4
 urllib3==2.8.0
 websocket-client==1.9.2
 psycopg[binary]==3.2.10
+yfinance==1.7.0
